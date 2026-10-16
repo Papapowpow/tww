@@ -308,7 +308,7 @@ local function cam()
     return workspace.CurrentCamera
 end
 
-local State = { holding = false, active = false, target = nil }
+local State = { holding = false, active = false, target = nil, mine = nil }
 genv.WW_SA_State = State   -- inspectable: getgenv().WW_SA_State.target
 
 -- Publish older runs + this one, so the NEXT run can switch this run's hook off.
@@ -467,6 +467,13 @@ end
 -- than a nil global (a local is not in scope inside its own initialiser).
 local originalGetMouseHit
 originalGetMouseHit = swap(Utils, "GetMouseHit", function(range, ...)
+    -- Auto mine first: while a mining stop is replaying, the swing and the
+    -- arm spring have to point at the ore whatever the aim is doing. Same
+    -- chokepoint FaceMouse already reads, so the rig turns onto it by itself.
+    local m = State.mine
+    if m and m.pos then
+        return m.pos, m.part, Vector3.new(0, 1, 0), Enum.Material.Air
+    end
     -- Read once, together. Anything that happens between here and the return
     -- must not be able to leave a half-cleared pair (active true, target gone).
     local active = State.active
@@ -2551,6 +2558,1394 @@ Visuals:CreateToggle({
     flag = "esp_animalalert",
     callback = function(v) Config.ESPAnimalAlert = v end,
 })
+
+--=========================== auto mine ===========================--
+-- Record a run by hand, then replay it. Three kinds of step:
+--
+--   walk   get to a recorded position. The rigs are server-owned: a CFrame
+--          write is snapped back within a frame and Humanoid:Move does nothing
+--          (the game pins WalkSpeed near zero whenever its own movement input
+--          is idle). What does work is a LinearVelocity on the rig's own root
+--          attachment - measured in this client, the rig travels at exactly the
+--          speed the constraint is set to.
+--   mine   stand on the recorded spot, aim at the recorded ore, work it. The
+--          hits go through the game's own mining calls (MiningHandler
+--          :HitDeposit plus the pickaxe's MineDeposit activation), so no mouse
+--          input is synthesised and a run works with the window unfocused.
+--   click  stand on the recorded spot, aim where the player aimed, and press.
+--          A proximity prompt is fired directly; anything else is a real click.
+--
+-- The store trip is part of the recording and replays like anything else.
+-- "Sell Ores" also stands on its own: it empties the inventory of ore through
+-- the game's own container sell - the same call the store UI makes when a sale
+-- is confirmed - so a run can bank its ore without depending on input replay.
+--
+-- MinePath / the state table live in getgenv() (WW_AM_State) so a reload keeps
+-- the recording and the controls stay pointed at the same table.
+local function initAutoMine()
+    local CollectionService = game:GetService("CollectionService")
+
+    local MinePath = "ww_automine.json"
+    local ORE_WORDS = { "Quartz", "Copper", "Iron", "Coal", "Gold", "Silver", "Zinc", "Limestone" }
+    local PICKAXES = {
+        "Tier7Pickaxe", "Tier6Pickaxe", "Tier5Pickaxe", "Tier4Pickaxe",
+        "Tier3Pickaxe", "Tier2Pickaxe", "BasicPickaxe",
+    }
+
+    local Mine = {
+        recording = false,
+        playing = false,
+        steps = {},
+        dirty = false,
+        status = "idle",
+        shown = nil,
+        speed = 26,      -- studs/s following the recorded path (the game flattens much above 30)
+        travel = 30,     -- studs/s getting to the run's starting point
+        loop = true,
+        swings = 3,      -- most swings spent on one recorded stop (caps a stop's length)
+        autosell = true,
+        spawn = "Recorded start",
+        respawnAt = "Don't respawn",   -- town to reset into before a run
+        respawnStart = true,           -- reset the character when a run starts
+        holdFrom = nil,                -- while recording: when F went down
+        holdAt = nil,                  -- and where it was held from
+    }
+    genv.WW_AM_State = Mine
+
+    local statusA, statusB
+    local amSave
+
+    local function setStatus(s)
+        Mine.status = s
+    end
+
+    --=========================== rig ===========================--
+    local function rig()
+        local folder = entityRoot()
+        if not (folder and lp) then return nil end
+        return folder:FindFirstChild(lp.Name)
+    end
+
+    local function root()
+        local r = rig()
+        if not r then return nil end
+        return r:FindFirstChild("HumanoidRootPart") or r.PrimaryPart
+    end
+
+    local function here()
+        local part = root()
+        return part and part.Position or nil
+    end
+
+    local function vec(v)
+        if type(v) ~= "table" then return nil end
+        return Vector3.new(v[1] or 0, v[2] or 0, v[3] or 0)
+    end
+
+    local function pack(p)
+        return { p.X, p.Y, p.Z }
+    end
+
+    --=========================== walker ===========================--
+    local Walker = { lv = nil, goal = nil, speed = 14 }
+
+    local function walkerEnsure()
+        local part = root()
+        if not part then return nil end
+        if Walker.lv and Walker.lv.Parent == part then return Walker.lv end
+        if Walker.lv then pcall(function() Walker.lv:Destroy() end) end
+        local att = part:FindFirstChild("RootRigAttachment") or part:FindFirstChildOfClass("Attachment")
+        if not att then return nil end
+        local lv = Instance.new("LinearVelocity")
+        lv.Name = "WW_AM_Walker"
+        lv.Attachment0 = att
+        lv.RelativeTo = Enum.ActuatorRelativeTo.World
+        lv.ForceLimitMode = Enum.ForceLimitMode.Magnitude
+        lv.MaxForce = 1e6
+        lv.Enabled = false
+        lv.Parent = part
+        Walker.lv = lv
+        return lv
+    end
+
+    local function walkerStop()
+        Walker.goal = nil
+        if Walker.lv then Walker.lv.Enabled = false end
+    end
+
+    local function walkerGo(goal, speed)
+        Walker.goal = goal
+        Walker.speed = speed or Mine.speed
+        local lv = walkerEnsure()
+        if lv then lv.Enabled = true end
+    end
+
+    local function walkerArrived(radius)
+        local p = here()
+        if not (p and Walker.goal) then return true end
+        local d = Walker.goal - p
+        return Vector3.new(d.X, 0, d.Z).Magnitude <= (radius or 3.5)
+    end
+
+    --- Called every frame. Vertical motion is left to gravity plus a small nudge
+    --- towards the goal's height, so the rig walks over a slope rather than being
+    --- pushed through it.
+    local function walkerStep()
+        local lv = Walker.lv
+        if not (lv and lv.Parent) then return end
+        local goal = Walker.goal
+        if not goal or not Mine.playing then
+            if lv.Enabled then lv.Enabled = false end
+            return
+        end
+        local p = here()
+        if not p then return end
+        local d = goal - p
+        local flat = Vector3.new(d.X, 0, d.Z)
+        if flat.Magnitude < 0.05 then
+            lv.Enabled = false
+            return
+        end
+        lv.VectorVelocity = (flat.Unit * Walker.speed) + Vector3.new(0, math.clamp(d.Y, -6, 6), 0)
+        lv.Enabled = true
+    end
+
+    --- Anything can wedge a rig - a wall, a shopfront, a fence - and a rig pressed
+    --- into one holds a commanded velocity while going nowhere. Each attempt backs
+    --- it off and offsets it a little further to one side, which is usually enough
+    --- to slide it along the obstacle instead of grinding into the same spot.
+    local function escapeFrom(goal, attempt, speed)
+        local p = here()
+        if not p then return end
+        local away = Vector3.new(p.X - goal.X, 0, p.Z - goal.Z)
+        if away.Magnitude < 0.1 then
+            away = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5)
+        end
+        local back = away.Unit
+        local side = Vector3.new(-back.Z, 0, back.X) * ((attempt % 2 == 0) and 1 or -1)
+        walkerGo(p + back * (3 + attempt) + side * (3 + attempt), speed or Mine.speed)
+        local t = os.clock() + 0.3
+        while os.clock() < t do task.wait(0.05) end
+    end
+
+    --- Walk to a point. Arriving is not the only way out: when the rig stops
+    --- covering ground it gets two escape attempts and is then given up on, and the
+    --- caller skips a few waypoints - a blocked step costs a second, not the run.
+    --- Returns whether the point was reached.
+    local function travelTo(goal, speed, timeout, radius)
+        if not goal then return false end
+        local limit = timeout or 25
+        local t0 = os.clock()
+        walkerGo(goal, speed)
+        local lastPos, lastMove = here(), os.clock()
+        local attempts = 0
+        while Mine.playing and os.clock() - t0 < limit do
+            if walkerArrived(radius) then break end
+            task.wait()
+            local p = here()
+            if p then
+                if lastPos and (p - lastPos).Magnitude > 0.6 then
+                    lastPos, lastMove = p, os.clock()
+                elseif os.clock() - lastMove > 1 then
+                    if attempts >= 2 then break end
+                    attempts += 1
+                    escapeFrom(goal, attempts, speed)
+                    walkerGo(goal, speed)
+                    lastPos, lastMove = here(), os.clock()
+                end
+            end
+        end
+        local arrived = walkerArrived(radius)
+        walkerStop()
+        task.wait(0.05)
+        return arrived
+    end
+
+    --- Following the path is a pursuit, not 1159 separate walks: the goal is only
+    --- re-pointed and the walker is left running, so the rig carries its speed
+    --- through the corners instead of stopping dead at every waypoint. Returns
+    --- whether the waypoint was reached.
+    local function walkAlong(point)
+        local goal = vec(point)
+        local p = here()
+        if not (goal and p) then return false end
+        local function speed()
+            local cur = here()
+            if not cur then return Mine.speed end
+            local far = (Vector3.new(goal.X, 0, goal.Z) - Vector3.new(cur.X, 0, cur.Z)).Magnitude
+            return far > 40 and Mine.travel or Mine.speed
+        end
+        walkerGo(goal, speed())
+        local t0 = os.clock()
+        local lastPos, lastMove = p, os.clock()
+        local attempts = 0
+        while Mine.playing and os.clock() - t0 < 8 do
+            if walkerArrived(2.5) then return true end
+            task.wait()
+            local cur = here()
+            if cur then
+                if (cur - lastPos).Magnitude > 0.6 then
+                    lastPos, lastMove = cur, os.clock()
+                elseif os.clock() - lastMove > 1 then
+                    if attempts >= 2 then return false end
+                    attempts += 1
+                    escapeFrom(goal, attempts, Mine.speed)
+                    walkerGo(goal, speed())
+                    lastPos, lastMove = here(), os.clock()
+                end
+            end
+        end
+        return walkerArrived(2.5)
+    end
+
+    --- Stop on a recorded standing spot before using it: a swing or a store click
+    --- only works from roughly where it was recorded.
+    local function settlePoint(point, timeout)
+        local goal = vec(point)
+        if not goal then return false end
+        return travelTo(goal, Mine.speed, timeout or 12, 3.5)
+    end
+
+    --=========================== path drawing ===========================--
+    local pathLines = {}
+
+    local function clearPathLines()
+        for _, l in ipairs(pathLines) do
+            pcall(function() l:Remove() end)
+        end
+        table.clear(pathLines)
+    end
+
+    local function project(world)
+        local camera = workspace.CurrentCamera
+        if not camera then return nil end
+        local v, onScreen = camera:WorldToViewportPoint(world)
+        if not onScreen or v.Z <= 0 then return nil end
+        return Vector2.new(v.X, v.Y)
+    end
+
+    local trail = newDraw("Line")
+    trail.Thickness, trail.Color, trail.Transparency, trail.Visible = 3, P.accent, 0.2, false
+
+    local function drawPath()
+        clearPathLines()
+        local pts = {}
+        for _, step in ipairs(Mine.steps) do
+            if step.k == "walk" then
+                local p = vec(step.p)
+                if p then pts[#pts + 1] = p end
+            end
+        end
+        local stride = math.max(1, math.floor(#pts / 400))
+        local sampled = {}
+        for i = 1, #pts, stride do sampled[#sampled + 1] = pts[i] end
+        for i = 2, #sampled do
+            local a, b = project(sampled[i - 1]), project(sampled[i])
+            if a and b then
+                local l = newDraw("Line")
+                l.From, l.To, l.Thickness, l.Color, l.Transparency = a, b, 2, P.accent, 0.45
+                pathLines[#pathLines + 1] = l
+            end
+        end
+    end
+
+    --=========================== record trail ===========================--
+    -- The route drawn where it is actually walked, so a recording can be watched
+    -- as it is laid down instead of only when it is replayed: a ribbon at the
+    -- rig's feet plus a flat marker every few studs.
+    local recFolder, recTrail, recAttA, recAttB, recLast = nil, nil, nil, nil, nil
+
+    local function recTrailStop()
+        for _, inst in ipairs({ recTrail, recAttA, recAttB }) do
+            if inst then pcall(function() inst:Destroy() end) end
+        end
+        if recFolder then pcall(function() recFolder:Destroy() end) end
+        recFolder, recTrail, recAttA, recAttB, recLast = nil, nil, nil, nil, nil
+    end
+
+    local function recTrailStart()
+        recTrailStop()
+        local part = root()
+        if not part then return end
+        local folder = Instance.new("Folder")
+        folder.Name = "WW_AM_Trail"
+        folder.Parent = workspace
+        recFolder = folder
+
+        local a = Instance.new("Attachment")
+        a.Position = Vector3.new(0, -2.4, 0.5)
+        a.Parent = part
+        local b = Instance.new("Attachment")
+        b.Position = Vector3.new(0, -2.4, -0.5)
+        b.Parent = part
+        local t = Instance.new("Trail")
+        t.Attachment0, t.Attachment1 = a, b
+        t.Lifetime, t.MinLength, t.LightEmission = 3, 0.2, 0.5
+        t.FaceCamera = false
+        t.Color, t.Transparency = ColorSequence.new(P.accent), NumberSequence.new(0.25)
+        t.Parent = part
+        recAttA, recAttB, recTrail = a, b, t
+    end
+
+    --- A flat marker at the rig's feet, kept a few studs apart so a long route
+    --- costs a few hundred parts rather than one per sampled point.
+    local function recTrailMark(point)
+        if not (recFolder and point) then return end
+        if recLast and (point - recLast).Magnitude < 5 then return end
+        recLast = point
+        local at = Vector3.new(point.X, point.Y - 2.6, point.Z)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { workspace.WORKSPACE_Entities }
+        local hit = workspace:Raycast(point, Vector3.new(0, -8, 0), params)
+        if hit then at = hit.Position + Vector3.new(0, 0.06, 0) end
+        local mark = Instance.new("Part")
+        mark.Name = "WW_AM_Mark"
+        mark.Size = Vector3.new(1.1, 0.12, 1.1)
+        mark.CFrame = CFrame.new(at)
+        mark.Anchored, mark.CanCollide, mark.CanQuery, mark.CanTouch = true, false, false, false
+        mark.Material, mark.Color, mark.Transparency = Enum.Material.Neon, P.accent, 0.35
+        mark.Parent = recFolder
+    end
+
+    --=========================== recording ===========================--
+    local function pushStep(step)
+        Mine.steps[#Mine.steps + 1] = step
+        Mine.dirty = true
+    end
+
+    local function oreTagOf(model)
+        if not model then return nil end
+        local info = Global.SharedData and Global.SharedData.OreDepositInfo
+        if type(info) == "table" then
+            for tag in pairs(info) do
+                if CollectionService:HasTag(model, tag) then return tag end
+            end
+        end
+        for _, tag in ipairs(CollectionService:GetTags(model)) do
+            if string.find(tag, "Ore", 1, true) or string.find(tag, "Vein", 1, true) then
+                return tag
+            end
+        end
+        return nil
+    end
+
+    local function recordWalk()
+        local p = here()
+        if not p then return end
+        local last = Mine.steps[#Mine.steps]
+        if last and last.k == "walk" then
+            local was = vec(last.p)
+            if was and (was - p).Magnitude < 1.5 then return end
+        end
+        pushStep({ k = "walk", p = pack(p) })
+    end
+
+    --- Consecutive hits on the same ore collapse into one stop, so a stop keeps
+    --- how long it took and roughly how many swings it needed.
+    local function recordMine(deposit, hitPos)
+        local p = here()
+        local aim = hitPos or (deposit and deposit:GetPivot().Position)
+        if not (p and aim) then return end
+        local last = Mine.steps[#Mine.steps]
+        local now = os.clock()
+        if last and last.k == "mine" and (now - (last.at or 0)) < 10 then
+            local was = vec(last.aim)
+            if was and (was - aim).Magnitude < 10 then
+                last.swings = (last.swings or 1) + 1
+                last.dur = (last.dur or 1) + 0.8
+                last.at = now
+                Mine.dirty = true
+                return
+            end
+        end
+        pushStep({
+            k = "mine", p = pack(p), aim = pack(aim), tag = oreTagOf(deposit),
+            swings = 1, dur = 1.2, at = now,
+        })
+    end
+
+    --- What the player pressed, where they were aiming, and - if a prompt was in
+    --- front of them - which prompt, so a replay can fire it without input.
+    local function recordClick()
+        local p = here()
+        if not p then return end
+        local aimPos, target
+        pcall(function()
+            local a, b = throughPrevious(originalGetMouseHit, 2000)
+            if typeof(a) == "Vector3" then aimPos = a end
+            if typeof(b) == "Instance" then target = b end
+        end)
+        local promptPath
+        pcall(function()
+            local prompt
+            if target and target:IsA("ProximityPrompt") then
+                prompt = target
+            elseif target then
+                prompt = target:FindFirstChildOfClass("ProximityPrompt")
+                if not prompt and target.Parent then
+                    prompt = target.Parent:FindFirstChildOfClass("ProximityPrompt")
+                end
+            end
+            if prompt then promptPath = prompt:GetFullName() end
+        end)
+        pushStep({
+            k = "click", p = pack(p),
+            aim = aimPos and pack(aimPos) or nil,
+            target = target and target:GetFullName() or nil,
+            promptPath = promptPath,
+        })
+    end
+
+    -- The pickaxe's own hit entry point. Hooked once; outside a recording it
+    -- costs one boolean test per swing.
+    local originalHitDeposit
+    originalHitDeposit = swap(Global.MiningHandler, "HitDeposit", function(self, deposit, hitPos, hitNormal)
+        if Mine.recording then pcall(recordMine, deposit, hitPos) end
+        return throughPrevious(originalHitDeposit, self, deposit, hitPos, hitNormal)
+    end)
+    STATE.onCleanup(function()
+        pcall(function() Global.MiningHandler.HitDeposit = originalHitDeposit end)
+    end)
+
+    local function recorderTick()
+        if not Mine.recording then return end
+        recordWalk()
+        local p = here()
+        if p then
+            local from = Mine.tailFrom or p
+            local a, b = project(from), project(p)
+            if a and b then
+                trail.From, trail.To = a, b
+                trail.Visible = true
+            end
+            Mine.tailFrom = p
+            recTrailMark(p)
+        end
+        -- F is the store's hold key - holding it is how loot is sold - so a hold is
+        -- kept open until the key comes back up and then stored as a step of its own.
+        if Mine.holdFrom and not UIS:IsKeyDown(Enum.KeyCode.F) then
+            local at = Mine.holdAt or p
+            pushStep({
+                k = "hold", p = at and pack(at) or nil, key = "F",
+                dur = math.max(0.5, os.clock() - Mine.holdFrom),
+            })
+            Mine.holdFrom, Mine.holdAt = nil, nil
+        end
+        setStatus(("recording - %d steps"):format(#Mine.steps))
+    end
+
+    local function startRecording()
+        Mine.steps = {}
+        Mine.dirty = false
+        Mine.tailFrom = nil
+        Mine.holdFrom, Mine.holdAt = nil, nil
+        Mine.recording = true
+        clearPathLines()
+        recTrailStart()
+        recordWalk()
+        setStatus("recording")
+        print("[auto_mine] recording started")
+    end
+
+    local function stopRecording()
+        if not Mine.recording then return end
+        if Mine.holdFrom then
+            Mine.holdFrom, Mine.holdAt = nil, nil
+        end
+        Mine.recording = false
+        trail.Visible = false
+        recTrailStop()
+        drawPath()
+        amSave()
+        setStatus(("stopped - %d steps"):format(#Mine.steps))
+        print(("[auto_mine] recording stopped, %d steps"):format(#Mine.steps))
+    end
+
+    --=========================== mining ===========================--
+    local function aimAt(pos, part)
+        State.mine = { pos = pos, part = part }
+    end
+
+    local function clearAim()
+        State.mine = nil
+    end
+
+    --- A swing's hitbox hangs off the rig's own facing, and the game only turns the
+    --- rig the way the player is looking - so mining on aim alone still means
+    --- holding the camera on the ore by hand. Turn the rig at the aim itself, on the
+    --- frame and after the game has written its own transform for that frame, so a
+    --- swing faces the ore with the camera left wherever it is.
+    track(RunService.RenderStepped, function()
+        local m = State.mine
+        local part = root()
+        if not (m and m.pos and part) then return end
+        local flat = Vector3.new(m.pos.X - part.Position.X, 0, m.pos.Z - part.Position.Z)
+        if flat.Magnitude < 0.25 then return end
+        part.CFrame = CFrame.lookAt(part.Position, part.Position + flat.Unit)
+    end)
+
+    --- Ore is worked out and grows back, so the instance a hit was recorded on is
+    --- a hint rather than a promise: the same ore nearest that spot is used.
+    local function scanTag(tag, aim, radius, list)
+        for _, model in ipairs(CollectionService:GetTagged(tag)) do
+            if model:IsDescendantOf(workspace) then
+                local d = (model:GetPivot().Position - aim).Magnitude
+                if d <= (radius or 16) then
+                    list[#list + 1] = { model = model, d = d }
+                end
+            end
+        end
+    end
+
+    --- The tag the hit was recorded against first. The vein tags carry no parts
+    --- until you are on top of them, so when that comes back empty any ore close
+    --- enough to the recorded spot is taken instead - the spot is where the
+    --- swing actually landed.
+    local function depositsNear(tag, aim, radius)
+        local list = {}
+        if not aim then return list end
+        if tag then scanTag(tag, aim, radius, list) end
+        if #list == 0 then
+            local info = Global.SharedData and Global.SharedData.OreDepositInfo
+            if type(info) == "table" then
+                for other in pairs(info) do
+                    if other ~= tag then scanTag(other, aim, radius, list) end
+                end
+            end
+        end
+        table.sort(list, function(a, b) return a.d < b.d end)
+        return list
+    end
+
+    --- OWNED items only. GetItemsRaw() is every item *definition* in the game -
+    --- 229 of them - so picking from it equips a pickaxe nobody owns, and handing
+    --- an item instance (rather than an {Id, Type} data record) to _DirectEquipItem
+    --- leaves EquippedItemData with no Type, which breaks every equip until a
+    --- rejoin. The owned items are the container's {Id, Type, StackSize} records.
+    local function ownedPickaxe()
+        local pd = Global.PlayerData
+        local items = pd and pd.InventoryContainer and pd.InventoryContainer.Items
+        if type(items) ~= "table" then return nil end
+        for _, name in ipairs(PICKAXES) do
+            for _, item in pairs(items) do
+                if type(item) == "table" and tostring(item.Type) == name and type(item.Id) == "string" then
+                    return item
+                end
+            end
+        end
+        return nil
+    end
+
+    --- Equipping is what puts the item in the server's hands, and the server only
+    --- takes a MineDeposit from the pickaxe it believes is equipped. The animated
+    --- EquipItem is tried first (that is what picking it from the hotbar does), but
+    --- its switch is skipped while another switch runs or for half a second after
+    --- one, so the immediate path is the fallback - and _DirectEquipItem wants the
+    --- data record, never the item instance.
+    --- Equipping is refused outright while the client still believes it is dead,
+    --- and that flag outlives the death: after a respawn the rig is standing there
+    --- with full health while IsDead is still true, so CanEquipItems says no, every
+    --- equip quietly bounces, and the run swings a pickaxe nobody is holding - no
+    --- ore, no error, nothing on screen. Clear it while the rig and health disagree.
+    local function reviveState()
+        local pc = Global.PlayerCharacter
+        if not pc or not pc.IsDead then return false end
+        local alive = false
+        pcall(function()
+            local rc = Global.RepCharHandler:GetRepChar(lp)
+            alive = (rc and (rc.State.Health or 0) > 0) and true or false
+        end)
+        if alive and rig() then
+            pcall(function() pc.IsDead = false end)
+            return true
+        end
+        return false
+    end
+
+    --- The instance the game itself swings with: GetEquippedItem() is just
+    --- GetItem(EquippedItemData.Type), and this is the object that carries
+    --- NetworkActivate and, once equipped, Hitbox.
+    local function bestPickaxe()
+        local pc = Global.PlayerCharacter
+        if not pc then return nil end
+        local record = ownedPickaxe()
+        if not record then
+            setStatus("no pickaxe in your inventory")
+            return nil
+        end
+
+        local function held()
+            local t
+            pcall(function() t = pc:GetEquippedItemType() end)
+            return t
+        end
+
+        if held() ~= record.Type then
+            reviveState()
+            pcall(function() pc:EquipItem(record) end)
+            local deadline = os.clock() + 3
+            while held() ~= record.Type and os.clock() < deadline do
+                task.wait(0.1)
+            end
+            if held() ~= record.Type then
+                pcall(function() pc:_DirectEquipItem(record) end)
+                task.wait(0.4)
+            end
+            if held() ~= record.Type then
+                -- the dead flag is the usual reason an equip bounces: set it back
+                -- only if the game did, then take the immediate path once more
+                reviveState()
+                pcall(function() pc:_DirectEquipItem(record) end)
+                task.wait(0.4)
+            end
+            if held() ~= record.Type then
+                setStatus("cannot equip " .. record.Type)
+                return nil
+            end
+        end
+
+        local item
+        pcall(function() item = pc:GetItem(record.Type) end)
+        return item
+    end
+
+    --- How close to the ore a swing has to be made from. The recorded standing
+    --- spot is where the swing that was recorded landed from, so arriving there is
+    --- most of it - but a swing that stops a few studs short of the ore is not a
+    --- short hit, it is no hit at all, and the last stretch is walked deliberately
+    --- rather than trusted to the arrival radius.
+    local ENGAGE_RANGE = 3.5
+
+    --- What the server has confirmed about a deposit. Progress and OreRemaining are
+    --- replicated values the client never writes - HitDeposit only shows a tooltip -
+    --- so a change here is the server agreeing that a hit landed.
+    local function depositState(model)
+        local info = model and model:FindFirstChild("DepositInfo")
+        if not info then return nil end
+        local okA, progress = pcall(function() return info.Progress.Value end)
+        local okB, ore = pcall(function() return info.OreRemaining.Value end)
+        if not (okA and okB) then return nil end
+        return { progress = progress, ore = ore }
+    end
+
+    --- The game's own swing. PickaxeItemType.Swing plays a ready wind-up the first
+    --- time and the module holds a swing lock while one is running, so this asks
+    --- until a swing is actually in flight instead of assuming one call did it.
+    --- Everything the server wants to see - the MeleeSwing activation and the
+    --- hitbox Touched that fires the mining activation - happens inside this call.
+    local function swingPickaxe(item)
+        if not item then return false end
+        local deadline = os.clock() + 0.5
+        while os.clock() < deadline do
+            if not pcall(function() item:Swing() end) then return false end
+            if item.Swinging then return true end
+            task.wait(0.05)
+        end
+        return item.Swinging == true
+    end
+
+    --- Close the last studs to the ore, keeping the side the rig is already on.
+    local function engageOre(target)
+        local p = here()
+        if not (p and target) then return false end
+        local centre = target.PrimaryPart and target.PrimaryPart.Position or target:GetPivot().Position
+        local away = Vector3.new(p.X - centre.X, 0, p.Z - centre.Z)
+        if away.Magnitude < 0.05 then away = Vector3.new(1, 0, 0) end
+        local goal = centre + away.Unit * ENGAGE_RANGE
+        local flat = Vector3.new(goal.X - p.X, 0, goal.Z - p.Z)
+        if flat.Magnitude < 0.4 then return true end
+        travelTo(Vector3.new(goal.X, p.Y, goal.Z), Mine.speed, 4, 1.5)
+        task.wait(0.15)
+        return true
+    end
+
+    --- The nearest ore in the recorded cluster that still has something in it. A
+    --- worked-out deposit stays in the world and still reads as a target, and
+    --- swinging at one earns nothing, so it is stepped over rather than hit.
+    local function liveOre(list, skip)
+        for _, entry in ipairs(list) do
+            if entry.model ~= skip then
+                local state = depositState(entry.model)
+                if state and state.ore > 0 then return entry.model, state end
+            end
+        end
+        return nil
+    end
+
+    --- A mining stop. The rig goes to the recorded standing spot, closes the last
+    --- studs, and then swings the pickaxe the way a player does - the game's own
+    --- Swing, aimed at the ore through the GetMouseHit hook - because the mining
+    --- activation rides on that swing's hitbox Touched and not on anything the
+    --- client can substitute for it. Each swing is judged by what the server
+    --- confirms, not by what was sent.
+    ---
+    --- A stop is capped twice over: by Swings Per Ore, and by what the ore still
+    --- holds. A deposit that is already worked out is worth nothing to swing at, so
+    --- the stop steps to the next ore under the same tag or ends - either way in
+    --- about a second rather than sitting out the rest of the budget on a dead rock.
+    local function doMine(step)
+        local aim = vec(step.aim)
+        if not aim then return end
+        local label = tostring(step.tag or "ore")
+        local item = bestPickaxe()
+        local list = depositsNear(step.tag, aim, 16)
+        local target = liveOre(list) or (list[1] and list[1].model or nil)
+
+        if not target then
+            setStatus("no ore at this stop")
+            return
+        end
+
+        local stand = vec(step.p)
+        if stand and here() and (here() - stand).Magnitude > 6 then
+            settlePoint(stand, 8)
+        end
+        aimAt(aim, target)
+        task.wait(0.1)
+
+        local swings = math.min(math.max(step.swings or 1, 1), math.max(Mine.swings or 1, 1))
+        local hits, misses = 0, 0
+        while Mine.playing and hits < swings do
+            local before = depositState(target)
+            if not before then
+                setStatus("no ore at this stop")
+                break
+            end
+            if before.ore <= 0 then
+                local nextOre = liveOre(list, target)
+                if not nextOre then break end
+                target = nextOre
+                aimAt(aim, target)
+                task.wait(0.05)
+                before = depositState(target)
+            end
+            -- the ore cannot give more than it holds, so a full deposit does not have
+            -- to be swung at until the budget runs out
+            if before and before.ore > 0 and hits + before.ore < swings then
+                swings = hits + before.ore
+            end
+
+            swingPickaxe(item)
+            -- The deposit may only move when the server says so, and it moves the
+            -- moment the server agrees - so watch it closely and move on as soon as
+            -- it does rather than sitting out a fixed wait after every swing.
+            local after, landed = before, false
+            local until_ = os.clock() + 0.6
+            while os.clock() < until_ do
+                if before then
+                    after = depositState(target) or after
+                    if after and (after.progress ~= before.progress or after.ore ~= before.ore) then
+                        landed = true
+                        break
+                    end
+                end
+                task.wait(0.03)
+            end
+            if landed then
+                hits, misses = hits + 1, 0
+                setStatus(("mining %s %d/%d"):format(label, hits, swings))
+                -- the game's own swing lock is the fastest legal rate: wait out
+                -- exactly that and no longer
+                local cd = tonumber(item and item.NextCanSwing)
+                if cd then
+                    local w = cd - os.clock()
+                    if w > 0 and w < 1.2 then task.wait(w) end
+                end
+            else
+                -- Nothing confirmed. Either the swing stopped short of the ore or that
+                -- ore is worked out, and neither gets better by swinging again from
+                -- where the rig is: one walk to close the gap, then the ore is given
+                -- up on. Nothing is synthesised - an activation the swing did not earn
+                -- is one the server has no reason to take.
+                misses += 1
+                if misses >= 2 then break end
+                engageOre(target)
+                local state = depositState(target)
+                if not state or state.ore <= 0 then
+                    local nextOre = liveOre(list, target)
+                    if not nextOre then break end
+                    target = nextOre
+                end
+                aimAt(aim, target)
+                task.wait(0.05)
+            end
+        end
+        setStatus(("mined %s %d/%d"):format(label, hits, swings))
+        clearAim()
+    end
+
+    local function doClick(step)
+        local aim = vec(step.aim)
+        if aim then
+            aimAt(aim)
+            task.wait(0.3)
+        end
+        local fired = false
+        if step.promptPath then
+            pcall(function()
+                local node = game
+                for part in string.gmatch(step.promptPath, "[^%.]+") do
+                    node = node and node:FindFirstChild(part)
+                end
+                if node and node:IsA("ProximityPrompt") then
+                    fireproximityprompt(node)
+                    fired = true
+                end
+            end)
+        end
+        if not fired then
+            pcall(function()
+                if mouse1click then
+                    mouse1click()
+                else
+                    mouse1press()
+                    task.wait(0.05)
+                    mouse1release()
+                end
+            end)
+        end
+        clearAim()
+        task.wait(0.35)
+    end
+
+    --=========================== selling ===========================--
+    --- Ore is a stacked item in the inventory container. Selling goes through the
+    --- container's own SellItem - the call the store UI makes when a sale is
+    --- confirmed - so the server sees exactly what it sees from the UI.
+    local function isOreItem(item)
+        local low = string.lower(tostring(item.Type or ""))
+        for _, word in ipairs(ORE_WORDS) do
+            if string.find(low, string.lower(word), 1, true) then return true end
+        end
+        return string.find(low, "ore", 1, true) ~= nil or string.find(low, "vein", 1, true) ~= nil
+    end
+
+    --- Selling is not a call the client makes: the store listens for a held key and
+    --- settles the sale on the server when the hold finishes, so the key is held the
+    --- way a player holds it. The game's own action is driven directly here - the
+    --- same handler the key itself lands in - so it works with the client unfocused;
+    --- the executor's key send is only the fallback.
+    local holdAction = { F = "InteractSecondary", E = "Interact", G = "InteractTertiary" }
+    local VK = { F = 70, E = 69, G = 71 }
+
+    local function holdKey(name, seconds)
+        local key = string.upper(tostring(name or "F"))
+        local hold = math.max(seconds or 1.5, 0.3)
+        local action
+        pcall(function()
+            local handler = Global.InputHandler
+            action = handler and handler:GetAction(holdAction[key] or key)
+        end)
+        if action and action.HandleInput then
+            local function fire(state)
+                pcall(function()
+                    action:HandleInput(action.Name or holdAction[key] or key, state, nil, true)
+                end)
+            end
+            fire(Enum.UserInputState.Begin)
+            local t = os.clock() + hold
+            while os.clock() < t do task.wait(0.1) end
+            fire(Enum.UserInputState.End)
+            return true
+        end
+        local vk = VK[key]
+        if not vk or type(keypress) ~= "function" then return false end
+        if not pcall(keypress, vk) then return false end
+        local t = os.clock() + hold
+        while os.clock() < t do task.wait(0.1) end
+        pcall(function() if type(keyrelease) == "function" then keyrelease(vk) end end)
+        return true
+    end
+
+    local function oreCount(container)
+        local items = container and container.Items
+        if type(items) ~= "table" then return 0 end
+        local n = 0
+        for _, item in pairs(items) do
+            if type(item) == "table" and isOreItem(item) then n += 1 end
+        end
+        return n
+    end
+
+    --- Selling is the store's hold key and nothing else: one hold sells the whole bag
+    --- in a single server pass. The per-item container call is not made any more - a
+    --- remote per ore in the bag is exactly the burst that gets a sale put on
+    --- cooldown - and a run whose sale did not land does not try again inside the
+    --- cooldown window, so the next round is not starting into a locked store.
+    local SELL_COOLDOWN = 45
+    local sellAt = 0
+
+    local function sellOres(force)
+        local pd = Global.PlayerData
+        local container = pd and pd.InventoryContainer
+        if not container then return 0 end
+        local before = oreCount(container)
+        if before == 0 then return 0 end
+        if not force and (os.clock() - sellAt) < SELL_COOLDOWN then
+            setStatus("sell on cooldown - skipped")
+            return 0
+        end
+        sellAt = os.clock()
+        setStatus("holding F to sell")
+        holdKey("F", 3)
+        -- the server settles the sale as the hold ends, so watch the bag rather than
+        -- assuming it landed
+        local after = before
+        local t = os.clock() + 1.5
+        while os.clock() < t do
+            task.wait(0.2)
+            after = oreCount(container)
+            if after < before then break end
+        end
+        return math.max(before - after, 0)
+    end
+
+    --=========================== spawn ===========================--
+    local function townNames()
+        local list = {}
+        local folder = Global.SharedData and Global.SharedData.SpawnInfoFolder
+        if folder then
+            for _, child in ipairs(folder:GetChildren()) do
+                list[#list + 1] = child.Name
+            end
+        end
+        table.sort(list)
+        return list
+    end
+
+    --- A named town resolves through the game's own spawn info first and the
+    --- spawn region tag after it; anything unresolved simply skips the trip.
+    local function spawnPoint(name)
+        if name == "Current position" then return here() end
+        if not name or name == "Recorded start" then
+            for _, step in ipairs(Mine.steps) do
+                if step.k == "walk" then return vec(step.p) end
+            end
+            return here()
+        end
+        local folder = Global.SharedData and Global.SharedData.SpawnInfoFolder
+        local child = folder and folder:FindFirstChild(name)
+        if child then
+            if child:IsA("BasePart") then return child.Position end
+            if child:IsA("Model") then
+                local part = child.PrimaryPart or child:FindFirstChildWhichIsA("BasePart")
+                if part then return part.Position end
+            end
+            if child:IsA("ObjectValue") and child.Value and child.Value:IsA("BasePart") then
+                return child.Value.Position
+            end
+        end
+        for _, part in ipairs(CollectionService:GetTagged("SpawnRegion_" .. name)) do
+            if part:IsA("BasePart") then return part.Position end
+        end
+        return nil
+    end
+
+    --=========================== respawn ===========================--
+    --- Respawn is the reset button's own remote followed by the spawn menu the game
+    --- opens for it. The menu is driven exactly as a player drives it - press the
+    --- town's button, then press Accept - because the remote that Accept sends is
+    --- not readable. Accept is ignored while the chosen region streams back in, and
+    --- there is no flag to wait on for that, so it is simply pressed until the menu
+    --- closes under it.
+    local function respawnUi()
+        local pg = lp and lp:FindFirstChild("PlayerGui")
+        return pg and pg:FindFirstChild("NewSpawnUI") or nil
+    end
+
+    local function press(button)
+        if not (button and firesignal) then return false end
+        if pcall(firesignal, button.Activated) then return true end
+        return pcall(firesignal, button.MouseButton1Click)
+    end
+
+    local function townButton(ui, town)
+        local screen = ui:FindFirstChild("Screen")
+        local body = screen and screen:FindFirstChild("SideBar")
+        body = body and body:FindFirstChild("Body")
+        if not body then return nil end
+        for _, d in ipairs(body:GetDescendants()) do
+            if d:IsA("GuiButton") and d.Name == town and d.Visible then return d end
+        end
+        return nil
+    end
+
+    local function respawnAt(town)
+        local ui = respawnUi()
+        if not ui then
+            setStatus("no spawn menu")
+            return false
+        end
+        if not ui.Enabled then
+            setStatus("resetting character")
+            pcall(function() Global.Network:FireServer("RespawnTriggered") end)
+            local t = os.clock() + 20
+            while os.clock() < t and not ui.Enabled do task.wait(0.2) end
+        end
+        if not ui.Enabled then
+            setStatus("spawn menu did not open")
+            return false
+        end
+        task.wait(0.8)
+
+        local screen = ui:FindFirstChild("Screen")
+        local accept = screen and screen:FindFirstChild("AcceptButton")
+        if not accept then
+            setStatus("no accept button")
+            return false
+        end
+
+        if type(town) == "string" and town ~= "" and town ~= "Don't respawn" then
+            local button = townButton(ui, town)
+            if button then
+                setStatus("spawning at " .. town)
+                press(button)
+            else
+                setStatus(town .. " is not offered here")
+            end
+        end
+
+        local deadline = os.clock() + 60
+        while os.clock() < deadline and ui.Enabled do
+            press(accept)
+            local slice = os.clock() + 1.5
+            while os.clock() < slice and ui.Enabled do task.wait(0.2) end
+        end
+
+        setStatus("waiting for character")
+        local rigT = os.clock() + 20
+        while os.clock() < rigT and not here() do task.wait(0.25) end
+        if here() then
+            walkerEnsure()
+            task.wait(0.4)
+        end
+        return here() ~= nil
+    end
+
+    --=========================== playback ===========================--
+    local function playRun()
+        local goal = spawnPoint(Mine.spawn)
+        if goal then
+            setStatus("travelling to start")
+            -- a leg over open ground; walking a straight line through a town is
+            -- what the recorded path is for
+            travelTo(goal, Mine.travel, 25, 4)
+        end
+        local i = 1
+        while i <= #Mine.steps do
+            if not Mine.playing then break end
+            local step = Mine.steps[i]
+            setStatus(("%s %d/%d"):format(step.k, i, #Mine.steps))
+            if step.k == "walk" then
+                -- a waypoint the rig cannot reach is skipped in a small jump, so a
+                -- wall costs a short detour instead of a stall on every step
+                i += walkAlong(step.p) and 1 or 6
+            elseif step.k == "mine" then
+                settlePoint(step.p, 12)
+                doMine(step)
+                i += 1
+            elseif step.k == "click" then
+                settlePoint(step.p, 12)
+                doClick(step)
+                i += 1
+            elseif step.k == "hold" then
+                settlePoint(step.p, 12)
+                setStatus(("holding %s"):format(tostring(step.key or "F")))
+                holdKey(step.key or "F", step.dur or 1.5)
+                i += 1
+            else
+                i += 1
+            end
+        end
+        walkerStop()
+        clearAim()
+        if Mine.playing and Mine.autosell then
+            setStatus("selling ore")
+            local n = sellOres()
+            setStatus(n > 0 and ("run finished - sold %d ore"):format(n)
+                or "run finished - sale did not land")
+        end
+        return Mine.playing
+    end
+
+    local function startRun()
+        if Mine.recording then stopRecording() end
+        if #Mine.steps == 0 then
+            setStatus("nothing recorded yet")
+            return
+        end
+        if Mine.playing then return end
+        Mine.playing = true
+        task.spawn(function()
+            local town = Mine.respawnAt
+            if Mine.respawnStart and type(town) == "string" and town ~= "" and town ~= "Don't respawn" then
+                setStatus("respawning at " .. town)
+                respawnAt(town)
+            end
+            while Mine.playing do
+                reviveState()
+                playRun()
+                if not Mine.loop then break end
+                task.wait(0.4)
+            end
+            Mine.playing = false
+            walkerStop()
+            clearAim()
+            setStatus("idle")
+            print("[auto_mine] run stopped")
+        end)
+    end
+
+    local function stopRun()
+        Mine.playing = false
+        walkerStop()
+        clearAim()
+        setStatus("stopping")
+    end
+
+    --=========================== file ===========================--
+    amSave = function()
+        local out = { version = 1, spawn = Mine.spawn, respawnAt = Mine.respawnAt, steps = {} }
+        for _, step in ipairs(Mine.steps) do
+            out.steps[#out.steps + 1] = {
+                k = step.k, p = step.p, aim = step.aim, tag = step.tag,
+                swings = step.swings, dur = step.dur, promptPath = step.promptPath,
+                key = step.key,
+            }
+        end
+        pcall(writeJson, MinePath, out)
+        Mine.dirty = false
+    end
+
+    local function amLoad()
+        local data = readJson(MinePath)
+        if type(data) ~= "table" or type(data.steps) ~= "table" then return false end
+        Mine.steps = data.steps
+        if type(data.spawn) == "string" then Mine.spawn = data.spawn end
+        if type(data.respawnAt) == "string" then Mine.respawnAt = data.respawnAt end
+        return true
+    end
+
+    --=========================== window ===========================--
+    local AutoWindow = Sleek.newWindow({ title = "AUTO MINE", subtitle = "record + replay" })
+    table.insert(genv.WW_SA_Guis, AutoWindow.screenGui)
+    local autoShell = AutoWindow.screenGui:FindFirstChild("Window")
+    if autoShell then
+        -- beside the main window rather than straight over it; it drags as usual
+        autoShell.Position = UDim2.new(0.5, 46, 0.5, -204)
+    end
+    AutoWindow:SetVisible(false)
+
+    local function statusLine(tab)
+        return text(tab.page, {
+            Text = "idle",
+            Size = UDim2.new(1, -24, 0, 16),
+            Font = FONT_SEMI,
+            TextSize = 11,
+            TextColor3 = P.accent,
+            LayoutOrder = 900,
+        })
+    end
+
+    local RecordTab = AutoWindow:CreateTab({ name = "Record" })
+    statusA = statusLine(RecordTab)
+
+    RecordTab:CreateButton({
+        name = "Start Recording Path",
+        callback = function() startRecording() end,
+    })
+    RecordTab:CreateButton({
+        name = "Stop Recording",
+        callback = function() stopRecording() end,
+    })
+    RecordTab:CreateButton({
+        name = "Clear Path",
+        callback = function()
+            Mine.steps = {}
+            Mine.dirty = false
+            clearPathLines()
+            setStatus("path cleared")
+        end,
+    })
+    RecordTab:CreateButton({
+        name = "Show / Hide Recorded Path",
+        callback = function()
+            if #pathLines > 0 then clearPathLines() else drawPath() end
+        end,
+    })
+    RecordTab:CreateDivider({ text = "walk, mine, click, and hold F at the store - a held F is recorded as its own step" })
+
+    local RunTab = AutoWindow:CreateTab({ name = "Auto Mine" })
+    statusB = statusLine(RunTab)
+
+    local spawnOptions = { "Recorded start", "Current position" }
+    for _, town in ipairs(townNames()) do
+        spawnOptions[#spawnOptions + 1] = town
+    end
+
+    RunTab:CreateDropdown({
+        name = "Spawn Location",
+        description = "Where a run starts. The bot travels here first, then follows the recording.",
+        options = spawnOptions,
+        value = Mine.spawn,
+        callback = function(v) Mine.spawn = v end,
+    })
+
+    local respawnOptions = { "Don't respawn" }
+    for _, town in ipairs(townNames()) do
+        respawnOptions[#respawnOptions + 1] = town
+    end
+
+    RunTab:CreateDropdown({
+        name = "Respawn At",
+        description = "A town from the game's own spawn menu. Pick one and a run resets the character into it first.",
+        options = respawnOptions,
+        value = Mine.respawnAt,
+        callback = function(v) Mine.respawnAt = v end,
+    })
+    RunTab:CreateToggle({
+        name = "Respawn On Start",
+        description = "Reset the character and spawn at the town above when a run starts.",
+        value = Mine.respawnStart,
+        callback = function(v) Mine.respawnStart = v and true or false end,
+    })
+    RunTab:CreateButton({
+        name = "Respawn Now",
+        callback = function()
+            local town = Mine.respawnAt
+            task.spawn(function()
+                if type(town) == "string" and town ~= "" and town ~= "Don't respawn" then
+                    respawnAt(town)
+                else
+                    pcall(function() Global.Network:FireServer("RespawnTriggered") end)
+                    setStatus("respawn requested")
+                end
+            end)
+        end,
+    })
+    RunTab:CreateDivider({ text = "the game flattens anything much above 30 st/s, so ~26-30 is the fast setting" })
+
+    RunTab:CreateSlider({
+        name = "Path Speed",
+        range = { 4, 30 },
+        increment = 1,
+        value = Mine.speed,
+        suffix = " st/s",
+        callback = function(v) Mine.speed = v end,
+    })
+    RunTab:CreateSlider({
+        name = "Travel Speed",
+        range = { 10, 40 },
+        increment = 2,
+        value = Mine.travel,
+        suffix = " st/s",
+        callback = function(v) Mine.travel = v end,
+    })
+    RunTab:CreateSlider({
+        name = "Swings Per Ore",
+        range = { 1, 12 },
+        increment = 1,
+        value = Mine.swings,
+        suffix = "x",
+        callback = function(v) Mine.swings = v end,
+    })
+    RunTab:CreateDivider({ text = "Swings Per Ore caps a stop: lower is a faster run, higher empties the ore" })
+    RunTab:CreateToggle({
+        name = "Loop Runs",
+        value = Mine.loop,
+        callback = function(v) Mine.loop = v and true or false end,
+    })
+    RunTab:CreateToggle({
+        name = "Sell Ore After Each Run",
+        description = "One hold of the store's sell key at the end of a run, with a cooldown so a failed sale is not retried into a lockout.",
+        value = Mine.autosell,
+        callback = function(v) Mine.autosell = v and true or false end,
+    })
+    RunTab:CreateButton({
+        name = "Start Auto Mine",
+        callback = function() startRun() end,
+    })
+    RunTab:CreateButton({
+        name = "Stop",
+        callback = function() stopRun() end,
+    })
+    RunTab:CreateButton({
+        name = "Sell Ores Now",
+        description = "One hold of the store's sell key. Sells in a single pass rather than a burst of requests.",
+        callback = function()
+            setStatus(("sold %d ore"):format(sellOres(true)))
+        end,
+    })
+    RunTab:CreateButton({
+        name = "Hold F (Sell Loot)",
+        description = "Holds the store's own sell key for three seconds, wherever the character is standing.",
+        callback = function()
+            task.spawn(function()
+                setStatus("holding F")
+                holdKey("F", 3)
+                setStatus("held F")
+            end)
+        end,
+    })
+    RunTab:CreateButton({
+        name = "Save Path",
+        callback = function()
+            amSave()
+            setStatus("saved")
+        end,
+    })
+
+    -- the entry point on the main window
+    Window:CreateTab({ name = "Mine" }):CreateButton({
+        name = "Auto Mine",
+        callback = function() AutoWindow:Toggle() end,
+    })
+
+    --=========================== wiring ===========================--
+    if amLoad() then
+        drawPath()
+    end
+
+    track(RunService.Heartbeat, function()
+        walkerStep()
+        recorderTick()
+        if Mine.status ~= Mine.shown then
+            Mine.shown = Mine.status
+            if statusA and statusA.Parent then statusA.Text = Mine.status end
+            if statusB and statusB.Parent then statusB.Text = Mine.status end
+        end
+    end)
+
+    track(UIS.InputBegan, function(input, processed)
+        if not Mine.recording then return end
+        -- The store's hold key is recorded where it is held, whether or not the game
+        -- consumed the press.
+        if input.UserInputType == Enum.UserInputType.Keyboard
+            and input.KeyCode == Enum.KeyCode.F then
+            Mine.holdFrom, Mine.holdAt = os.clock(), here()
+        end
+        if processed then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            pcall(recordClick)
+        end
+    end)
+
+    STATE.onCleanup(function()
+        Mine.recording = false
+        Mine.playing = false
+        Walker.goal = nil
+        if Walker.lv then pcall(function() Walker.lv:Destroy() end) end
+        clearPathLines()
+        recTrailStop()
+        if Mine.dirty and #Mine.steps > 0 then pcall(amSave) end
+        print("[auto_mine] cleaned")
+    end)
+
+    print(("[auto_mine] ready - %d steps loaded"):format(#Mine.steps))
+end
+
+initAutoMine()
 
 -- Pull back whatever the Rayfield build had saved, so nothing tuned is lost.
 -- It writes its own file from the next change onwards, but the flag names and
